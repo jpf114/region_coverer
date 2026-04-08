@@ -1,0 +1,4 @@
+s2sphere>=0.2.5
+shapely>=2.0.0
+cryptography>=41.0.0
+psycopg2-binary>=2.9.0

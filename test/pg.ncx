@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Connections Ver="1.5">
+	<Connection ConnectionName="PGIS" ProjectUUID="" ConnType="POSTGRESQL" ServiceProvider="Default" Host="127.0.0.1" Port="5432" Database="postgres" UserName="postgres" Password="ECB0A8441D11779F728D5D34E7870BB2" SavePassword="true" HostTypePreference="Default" SettingsSavePath="C:\Users\TDT-DELL\Documents\Navicat\PostgreSQL\Servers\PGIS" SessionLimit="0" Keepalive="false" KeepaliveInterval="240" AutoConnect="false" ClientDriverEncoding="" ClientEncoding="65001" UseAdvanced="false" SSL="false" SSH="false" HTTP="false"/>
+</Connections>
+
