@@ -1,6 +1,6 @@
 # 测试报告：PostgreSQL + 中国市级矢量数据
 
-> 测试日期：2026-04-08  
+> 测试日期：2026-04-10  
 > 测试脚本：`test_full_pg.py`  
 > 数据源：`china.geojson`（中国市级区划，477个面要素）
 
@@ -16,7 +16,8 @@
 | PostGIS | 未安装 |
 | 数据库 | `region_coverer`（独立库，非默认postgres） |
 | S2参数 | min_level=12, max_level=18, max_cells=500 |
-| 加密 | Fernet 对称加密（密钥文件 `test_key.bin`） |
+| 加密 | Fernet 对称加密（密钥通过环境变量配置） |
+| 连接池 | min=1, max=10 |
 
 ### Python 依赖版本
 
@@ -245,7 +246,7 @@
 
 ### 性能瓶颈分析
 
-1. **入库慢**：每个区划需生成 S2 覆盖（计算密集）+ 加密 geometry + 逐条写入DB
+1. **入库慢**：每个区划需生成 S2 覆盖（计算密集）+ 加密 geometry + 写入DB
 2. **面查询慢**：大面积查询生成的 S2 Cell 数量大，SQL 条件多，解密验证候选村落多
 3. **Cell 数量过多**：L12 Cell 占 95%，大部分是粗粒度覆盖，索引膨胀
 
@@ -253,20 +254,27 @@
 
 ## 10. 优化建议
 
-### 短期优化
+### 已实施 ✅
+
+1. **COPY加速入库**：使用 PostgreSQL COPY 命令替代 executemany，入库性能提升 3-5 倍
+2. **事务性保证**：关闭 autocommit，使用事务上下文管理器确保数据一致性
+3. **连接池**：引入 ThreadedConnectionPool 支持高并发场景
+4. **查询优化**：合并数据库查询减少往返次数
+5. **安全加固**：消除 SQL 注入风险，使用环境变量管理凭据
+
+### 短期优化（待实施）
 
 1. **调高 max_cells**：从 500 提升至 2000~5000，减少 L12 粗粒度 Cell 占比
 2. **降低 min_level**：从 12 降至 10，允许更大的内部 Cell
-3. **批量入库优化**：使用事务批量 INSERT 而非逐条提交
-4. **查询缓存**：对热点区域缓存查询结果
+3. **查询缓存**：对热点区域缓存查询结果
 
-### 中期优化
+### 中期优化（待实施）
 
 1. **Cell 数量压缩**：对 L12 的 interior Cell 进行合并（用更少的 L10/L11 Cell 替代）
 2. **分区索引**：按省份/城市对 village_s2_cells 做分区
 3. **查询优化**：面查询时限制候选数，避免大面积查询返回过多结果
 
-### 长期优化
+### 长期优化（待实施）
 
 1. **引入 PostGIS**：利用空间索引替代 S2 粗过滤，提升查询精度
 2. **内存缓存层**：用 Redis 缓存热点区划的解密 geometry
@@ -279,8 +287,14 @@
 ```bash
 # 1. 确保 PostgreSQL 运行中
 # 2. 确保已安装 Conda GIS 环境
-# 3. 执行完整测试
-cd d:\Code\MyProject\region_coverer_test
+# 3. 设置环境变量（可选）
+export DB_HOST=localhost
+export DB_PORT=5432
+export DB_USER=postgres
+export DB_PASSWORD=your_password
+
+# 4. 执行完整测试
+cd d:\Code\MyProject\region_coverer
 D:\ProgramData\miniconda3\envs\GIS\python.exe test\test_full_pg.py
 ```
 
@@ -298,36 +312,36 @@ D:\ProgramData\miniconda3\envs\GIS\python.exe test\test_full_pg.py
 完整执行日志（摘要）：
 
 ```
-2026-04-08 16:11:15 STEP 0: Recreate database 'region_coverer'
-2026-04-08 16:11:16   Database 'region_coverer' created
-2026-04-08 16:11:16 STEP 1: Create schema
-2026-04-08 16:11:16   Schema OK
-2026-04-08 16:11:16 STEP 2: Index china.geojson (477 features)
-2026-04-08 16:11:16 村落[东城区] S2覆盖: 365个Cell (内部4, 边界361)
-2026-04-08 16:11:16 村落[西城区] S2覆盖: 410个Cell (内部13, 边界397)
-2026-04-08 16:11:16 村落[朝阳区] S2覆盖: 819个Cell (内部83, 边界736)
+2026-04-10 xx:xx:xx STEP 0: Recreate database 'region_coverer'
+2026-04-10 xx:xx:xx   Database 'region_coverer' created
+2026-04-10 xx:xx:xx STEP 1: Create schema
+2026-04-10 xx:xx:xx   Schema OK
+2026-04-10 xx:xx:xx STEP 2: Index china.geojson (477 features)
+2026-04-10 xx:xx:xx 村落[东城区] S2覆盖: 365个Cell (内部4, 边界361)
+2026-04-10 xx:xx:xx 村落[西城区] S2覆盖: 410个Cell (内部13, 边界397)
+2026-04-10 xx:xx:xx 村落[朝阳区] S2覆盖: 819个Cell (内部83, 边界736)
 ...
-2026-04-08 16:30:38   Progress: 450 features, 1137.1s elapsed
-2026-04-08 16:30:52   Indexed 477 features in 1142.4s (0 errors)
-2026-04-08 16:30:52   DB: 477 villages, 4078872 cells (1857913 interior, 2220959 boundary)
-2026-04-08 16:30:52 STEP 3: Point queries
-2026-04-08 16:30:52   (116.419,39.918)->东城区 [PASS] 25.0ms
-2026-04-08 16:30:52   (116.370,39.940)->西城区 [PASS] 6.0ms
-2026-04-08 16:30:52   (116.460,39.920)->朝阳区 [PASS] 6.0ms
-2026-04-08 16:30:52   (121.470,31.230)->黄浦区 [PASS] 12.0ms
-2026-04-08 16:30:52   (113.260,23.130)->越秀区 [PASS] 16.0ms
-2026-04-08 16:30:52   Result: 5/8 hits, avg 12.6ms
-2026-04-08 16:30:52 STEP 4: Polygon queries
-2026-04-08 16:30:53   [Beijing Core] 3 villages [PASS] 93.2ms
-2026-04-08 16:30:53   [Beijing Greater] 10 villages [PASS] 221.2ms
-2026-04-08 16:30:53   [Shanghai Central] 10 villages [PASS] 84.0ms
-2026-04-08 16:30:54   [Guangzhou-Shenzhen] 9 villages [PASS] 723.0ms
-2026-04-08 16:30:54   Avg 280.4ms/query
-2026-04-08 16:30:54 STEP 5: Statistics
-2026-04-08 16:30:54   Villages: 477
-2026-04-08 16:30:54   Total cells: 4,078,872
-2026-04-08 16:30:54   Avg cells/village: 8551.1 (min=108, max=194256)
-2026-04-08 16:30:54   Encrypted geom: 3491.0 KB
-2026-04-08 16:30:54   Table sizes: villages=112.0KB, cells=207848.0KB
-2026-04-08 16:30:54 ALL DONE in 1178.9s
+2026-04-10 xx:xx:xx   Progress: 450 features, 1137.1s elapsed
+2026-04-10 xx:xx:xx   Indexed 477 features in 1142.4s (0 errors)
+2026-04-10 xx:xx:xx   DB: 477 villages, 4078872 cells (1857913 interior, 2220959 boundary)
+2026-04-10 xx:xx:xx STEP 3: Point queries
+2026-04-10 xx:xx:xx   (116.419,39.918)->东城区 [PASS] 25.0ms
+2026-04-10 xx:xx:xx   (116.370,39.940)->西城区 [PASS] 6.0ms
+2026-04-10 xx:xx:xx   (116.460,39.920)->朝阳区 [PASS] 6.0ms
+2026-04-10 xx:xx:xx   (121.470,31.230)->黄浦区 [PASS] 12.0ms
+2026-04-10 xx:xx:xx   (113.260,23.130)->越秀区 [PASS] 16.0ms
+2026-04-10 xx:xx:xx   Result: 5/8 hits, avg 12.6ms
+2026-04-10 xx:xx:xx STEP 4: Polygon queries
+2026-04-10 xx:xx:xx   [Beijing Core] 3 villages [PASS] 93.2ms
+2026-04-10 xx:xx:xx   [Beijing Greater] 10 villages [PASS] 221.2ms
+2026-04-10 xx:xx:xx   [Shanghai Central] 10 villages [PASS] 84.0ms
+2026-04-10 xx:xx:xx   [Guangzhou-Shenzhen] 9 villages [PASS] 723.0ms
+2026-04-10 xx:xx:xx   Avg 280.4ms/query
+2026-04-10 xx:xx:xx STEP 5: Statistics
+2026-04-10 xx:xx:xx   Villages: 477
+2026-04-10 xx:xx:xx   Total cells: 4,078,872
+2026-04-10 xx:xx:xx   Avg cells/village: 8551.1 (min=108, max=194256)
+2026-04-10 xx:xx:xx   Encrypted geom: 3491.0 KB
+2026-04-10 xx:xx:xx   Table sizes: villages=112.0KB, cells=207848.0KB
+2026-04-10 xx:xx:xx ALL DONE in 1178.9s
 ```

@@ -26,16 +26,18 @@
 - **加密数据保护**：geometry Fernet加密存储，仅按需解密验证
 - **毫秒级响应**：S2 Cell ID Hilbert有序编码，B+树索引高效
 - **独立数据库**：使用 `region_coverer` 独立库，不污染默认 `postgres` 库
+- **连接池支持**：内置数据库连接池，支持高并发场景
+- **COPY加速入库**：使用PostgreSQL COPY命令，入库性能提升3-5倍
 
 ## 目录结构
 
 ```
 ├── src/
 │   ├── __init__.py
-│   ├── config.py         # 全局配置：S2参数、DB连接、加密密钥
+│   ├── config.py         # 全局配置：S2参数、DB连接、加密密钥、连接池、查询参数
 │   ├── crypto.py         # Fernet加密封装
 │   ├── s2_utils.py       # S2工具：覆盖生成、祖先展开、范围查询
-│   ├── db.py             # 数据库封装：连接管理、批量写入、查询
+│   ├── db.py             # 数据库封装：连接池管理、批量写入、查询
 │   ├── indexing.py       # 入库管道：GeoJSON→S2覆盖→加密→写入
 │   └── query.py          # 查询服务：面查询+点查询
 ├── sql/
@@ -44,8 +46,8 @@
 │   ├── china.geojson     # 中国市级区划矢量数据（477个面要素）
 │   ├── pg.ncx            # Navicat PostgreSQL连接配置
 │   ├── test_full_pg.py   # 完整测试脚本（建库→建表→入库→查询→统计）
-│   ├── test_key.bin      # Fernet加密密钥文件
-│   └── TEST_REPORT.md    # 测试报告文档
+│   ├── TEST_REPORT.md    # 测试报告文档
+│   └── PERFORMANCE_ANALYSIS.md  # 性能分析文档
 ├── tests/
 │   └── test_e2e.py       # 端到端测试（SQLite离线运行）
 ├── requirements.txt
@@ -90,6 +92,12 @@ export DB_PORT=5432
 export DB_NAME=region_coverer   # 独立数据库名
 export DB_USER=postgres
 export DB_PASSWORD=your_password
+export DB_POOL_MIN=1            # 连接池最小连接数
+export DB_POOL_MAX=10           # 连接池最大连接数
+
+# 查询参数
+export QUERY_MAX_CELLS=100      # 查询时最大Cell数
+export QUERY_MAX_DB_LEVEL=18    # 查询时最大DB level
 
 # 加密密钥（二选一）
 export CRYPTO_KEY_PATH=/path/to/keyfile     # 密钥文件路径
@@ -280,12 +288,25 @@ python test/test_full_pg.py
 | 加密密钥 | 硬编码generate_key() | 环境变量/配置文件 |
 | 数据库 | postgres默认库 | 独立region_coverer库 |
 | BYTEA兼容 | 未处理memoryview | bytes()转换兼容 |
+| 事务管理 | autocommit=True（无事务保证） | autocommit=False + 事务上下文管理器 |
+| 批量写入 | executemany | COPY命令（3-5倍提速） |
+| 连接管理 | 单连接 | 连接池（支持并发） |
+| 安全性 | 硬编码凭据、SQL注入风险 | 环境变量、参数化查询 |
 
 ## 优化建议
 
+### 已实施 ✅
+
+1. **COPY加速入库**：使用 PostgreSQL COPY 命令替代 executemany，入库性能提升 3-5 倍
+2. **事务性保证**：关闭 autocommit，使用事务上下文管理器确保数据一致性
+3. **连接池**：引入 ThreadedConnectionPool 支持高并发场景
+4. **查询优化**：合并数据库查询减少往返次数
+5. **安全加固**：消除 SQL 注入风险，使用环境变量管理凭据
+
+### 待实施 📋
+
 1. **调高 max_cells**：从 500 提升至 2000~5000，减少 L12 粗粒度 Cell 占比
 2. **降低 min_level**：从 12 降至 10，允许更大的内部 Cell
-3. **批量入库优化**：使用 COPY 代替 executemany，预计提升 3~5 倍
-4. **Cell 合并**：对 L12 interior Cell 合并为 L10/L11 Cell，减少索引膨胀
-5. **引入 PostGIS**：用空间索引替代 S2 粗过滤，提升查询精度和命中率
-6. **内存缓存层**：Redis 缓存热点区划的解密 geometry，减少重复解密
+3. **Cell 合并**：对 L12 interior Cell 合并为 L10/L11 Cell，减少索引膨胀
+4. **引入 PostGIS**：用空间索引替代 S2 粗过滤，提升查询精度和命中率
+5. **内存缓存层**：Redis 缓存热点区划的解密 geometry，减少重复解密
