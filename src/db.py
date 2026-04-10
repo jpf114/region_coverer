@@ -1,30 +1,52 @@
 """
-数据库封装：连接管理、批量写入、查询辅助
+数据库封装：连接池管理、批量写入、查询辅助
 """
-import psycopg2
-import psycopg2.extras
+import io
+import logging
 from contextlib import contextmanager
 from typing import Generator
 
+import psycopg2
+from psycopg2 import pool, sql
+
 from .config import DBConfig
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
-    """数据库操作封装"""
+    """数据库操作封装（支持连接池）"""
 
     def __init__(self, config: DBConfig):
         self._config = config
+        self._pool: pool.ThreadedConnectionPool | None = None
         self._conn = None
 
     def connect(self) -> None:
-        """建立数据库连接"""
-        self._conn = psycopg2.connect(self._config.dsn)
-        self._conn.autocommit = True  # autocommit避免DDL死锁
+        """建立数据库连接池"""
+        if self._pool is None:
+            self._pool = pool.ThreadedConnectionPool(
+                minconn=self._config.pool_min,
+                maxconn=self._config.pool_max,
+                **self._config.get_connection_kwargs(),
+            )
+        self._conn = self._pool.getconn()
+        self._conn.autocommit = False
 
     def close(self) -> None:
         """关闭数据库连接"""
-        if self._conn and not self._conn.closed:
-            self._conn.close()
+        if self._conn is not None:
+            if not self._conn.closed:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+            if self._pool is not None:
+                self._pool.putconn(self._conn)
+            self._conn = None
+        if self._pool is not None:
+            self._pool.closeall()
+            self._pool = None
 
     @property
     def conn(self):
@@ -50,20 +72,81 @@ class Database:
         """回滚当前事务"""
         self.conn.rollback()
 
-    # ---------- 写入方法 ----------
+    @contextmanager
+    def transaction(self):
+        """事务上下文管理器"""
+        try:
+            yield self.conn
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    @staticmethod
+    def execute_ddl(config: DBConfig, ddl_sql: str) -> None:
+        """执行DDL语句（使用独立连接和autocommit）"""
+        conn = psycopg2.connect(**config.get_connection_kwargs())
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(ddl_sql)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def drop_database_safely(config: DBConfig, db_name: str) -> None:
+        """安全删除数据库（使用参数化标识符）"""
+        admin_config = DBConfig(
+            host=config.host,
+            port=config.port,
+            dbname="postgres",
+            user=config.user,
+            password=config.password,
+        )
+        conn = psycopg2.connect(**admin_config.get_connection_kwargs())
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
+                    (db_name,),
+                )
+                cur.execute(
+                    sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(db_name))
+                )
+        finally:
+            conn.close()
+
+    @staticmethod
+    def create_database_safely(config: DBConfig, db_name: str) -> None:
+        """安全创建数据库（使用参数化标识符）"""
+        admin_config = DBConfig(
+            host=config.host,
+            port=config.port,
+            dbname="postgres",
+            user=config.user,
+            password=config.password,
+        )
+        conn = psycopg2.connect(**admin_config.get_connection_kwargs())
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name))
+                )
+        finally:
+            conn.close()
 
     def insert_village(
         self,
         village_name: str,
         encrypted_geom: bytes,
-        province: str = None,
-        city: str = None,
-        county: str = None,
+        province: str | None = None,
+        city: str | None = None,
+        county: str | None = None,
         cell_count: int = 0,
     ) -> int:
-        """
-        插入村落主表记录，返回自增ID。
-        """
+        """插入村落主表记录，返回自增ID。"""
         with self.cursor() as cur:
             cur.execute(
                 """INSERT INTO villages (village_name, province, city, county, encrypted_geom, cell_count)
@@ -76,24 +159,20 @@ class Database:
         return village_id
 
     def batch_insert_cells(self, cell_records: list[tuple]) -> None:
-        """
-        批量插入S2 Cell索引记录。
-
-        cell_records格式: [(cell_id, village_id, is_interior, level), ...]
-        使用executemany批量写入，比单条INSERT快数十倍。
-        """
+        """批量插入S2 Cell索引记录（使用COPY加速）。"""
         if not cell_records:
             return
 
+        buf = io.StringIO()
+        for cell_id, village_id, is_interior, level in cell_records:
+            buf.write(f"{cell_id}\t{village_id}\t{is_interior}\t{level}\n")
+        buf.seek(0)
+
         with self.cursor() as cur:
-            psycopg2.extras.execute_values(
-                cur,
-                """INSERT INTO village_s2_cells (cell_id, village_id, is_interior, level)
-                   VALUES %s
-                   ON CONFLICT (cell_id, village_id) DO NOTHING""",
-                cell_records,
-                template="(%s, %s, %s, %s)",
-                page_size=1000,
+            cur.copy_from(
+                buf,
+                "village_s2_cells",
+                columns=("cell_id", "village_id", "is_interior", "level"),
             )
         self.commit()
 
@@ -102,52 +181,36 @@ class Database:
         village_name: str,
         encrypted_geom: bytes,
         cell_records: list[tuple],
-        province: str = None,
-        city: str = None,
-        county: str = None,
+        province: str | None = None,
+        city: str | None = None,
+        county: str | None = None,
     ) -> int:
-        """
-        事务性插入：同时写入村落主表和Cell索引表。
-
-        cell_records格式: [(cell_id, is_interior, level), ...]
-        """
-        with self.cursor() as cur:
-            # 1. 插入村落主表
-            cur.execute(
-                """INSERT INTO villages (village_name, province, city, county, encrypted_geom, cell_count)
-                   VALUES (%s, %s, %s, %s, %s, %s)
-                   RETURNING id""",
-                (village_name, province, city, county, encrypted_geom, len(cell_records)),
-            )
-            village_id = cur.fetchone()[0]
-
-            # 2. 批量插入Cell索引
-            if cell_records:
-                full_records = [
-                    (cell_id, village_id, is_interior, level)
-                    for cell_id, is_interior, level in cell_records
-                ]
-                psycopg2.extras.execute_values(
-                    cur,
-                    """INSERT INTO village_s2_cells (cell_id, village_id, is_interior, level)
-                       VALUES %s
-                       ON CONFLICT (cell_id, village_id) DO NOTHING""",
-                    full_records,
-                    template="(%s, %s, %s, %s)",
-                    page_size=1000,
+        """事务性插入：同时写入村落主表和Cell索引表。"""
+        with self.transaction():
+            with self.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO villages (village_name, province, city, county, encrypted_geom, cell_count)
+                       VALUES (%s, %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (village_name, province, city, county, encrypted_geom, len(cell_records)),
                 )
+                village_id = cur.fetchone()[0]
 
-        self.commit()
+                if cell_records:
+                    buf = io.StringIO()
+                    for cell_id, is_interior, level in cell_records:
+                        buf.write(f"{cell_id}\t{village_id}\t{is_interior}\t{level}\n")
+                    buf.seek(0)
+                    cur.copy_from(
+                        buf,
+                        "village_s2_cells",
+                        columns=("cell_id", "village_id", "is_interior", "level"),
+                    )
+
         return village_id
 
-    # ---------- 查询方法 ----------
-
     def query_cells_by_ids(self, cell_ids: list[int]) -> list[tuple]:
-        """
-        根据Cell ID列表精确查询。
-
-        返回: [(cell_id, village_id, is_interior, level), ...]
-        """
+        """根据Cell ID列表精确查询。返回: [(cell_id, village_id, is_interior, level), ...]"""
         if not cell_ids:
             return []
 
@@ -163,30 +226,24 @@ class Database:
     def query_cells_by_ranges(
         self, range_conditions: list[tuple[int, int]]
     ) -> list[tuple]:
-        """
-        根据Cell ID范围条件查询（捕获后代Cell）。
-
-        range_conditions: [(range_min, range_max), ...]
-        返回: [(cell_id, village_id, is_interior, level), ...]
-        """
+        """根据Cell ID范围条件查询（捕获后代Cell）。"""
         if not range_conditions:
             return []
 
-        # 构建OR条件
         conditions = []
         params = []
         for range_min, range_max in range_conditions:
             conditions.append("cell_id BETWEEN %s AND %s")
             params.extend([range_min, range_max])
 
-        sql = (
+        sql_query = (
             "SELECT cell_id, village_id, is_interior, level "
             "FROM village_s2_cells "
             "WHERE " + " OR ".join(conditions)
         )
 
         with self.cursor() as cur:
-            cur.execute(sql, params)
+            cur.execute(sql_query, params)
             return cur.fetchall()
 
     def query_cells_by_exact_and_range(
@@ -194,31 +251,39 @@ class Database:
         exact_ids: list[int],
         range_conditions: list[tuple[int, int]],
     ) -> list[tuple]:
-        """
-        组合查询：精确匹配 + 范围查询（面矢量查询的核心）。
-
-        返回去重后的: [(cell_id, village_id, is_interior, level), ...]
-        """
+        """组合查询：精确匹配 + 范围查询（面矢量查询的核心）。"""
         results = {}
 
-        # 1. 精确匹配
         if exact_ids:
             for row in self.query_cells_by_ids(exact_ids):
-                results[row[0]] = row  # cell_id作为key去重
+                results[row[0]] = row
 
-        # 2. 范围查询
         if range_conditions:
             for row in self.query_cells_by_ranges(range_conditions):
-                results[row[0]] = row  # cell_id作为key去重
+                results[row[0]] = row
 
         return list(results.values())
 
-    def get_village_by_id(self, village_id: int) -> tuple | None:
-        """
-        根据ID获取村落记录（不含加密几何）。
+    def query_cells_with_village_info(
+        self, cell_ids: list[int]
+    ) -> list[tuple]:
+        """一次性查询Cell信息+村落信息（减少往返）。返回: [(cell_id, village_id, is_interior, level, village_name, province, city, county), ...]"""
+        if not cell_ids:
+            return []
 
-        返回: (id, village_name, province, city, county, cell_count, created_at) 或 None
-        """
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT c.cell_id, c.village_id, c.is_interior, c.level,
+                          v.village_name, v.province, v.city, v.county
+                   FROM village_s2_cells c
+                   JOIN villages v ON c.village_id = v.id
+                   WHERE c.cell_id = ANY(%s)""",
+                (cell_ids,),
+            )
+            return cur.fetchall()
+
+    def get_village_by_id(self, village_id: int) -> tuple | None:
+        """根据ID获取村落记录（不含加密几何）。"""
         with self.cursor() as cur:
             cur.execute(
                 """SELECT id, village_name, province, city, county, cell_count, created_at
@@ -241,11 +306,7 @@ class Database:
             return bytes(val) if not isinstance(val, bytes) else val
 
     def get_villages_by_ids(self, village_ids: list[int]) -> dict[int, tuple]:
-        """
-        批量获取村落信息（不含加密几何）。
-
-        返回: {village_id: (id, village_name, province, city, county), ...}
-        """
+        """批量获取村落信息（不含加密几何）。"""
         if not village_ids:
             return {}
 
@@ -258,11 +319,7 @@ class Database:
             return {row[0]: row for row in cur.fetchall()}
 
     def get_encrypted_geoms_batch(self, village_ids: list[int]) -> dict[int, bytes]:
-        """
-        批量获取村落的加密几何数据。
-
-        返回: {village_id: encrypted_geom_bytes, ...}
-        """
+        """批量获取村落的加密几何数据。"""
         if not village_ids:
             return {}
 

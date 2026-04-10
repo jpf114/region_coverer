@@ -14,15 +14,12 @@ import os
 import sys
 import sqlite3
 import tempfile
-import json
 
-# 确保src目录可导入
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from shapely.geometry import Polygon, Point, MultiPolygon, mapping
-from shapely import wkb
+from shapely.geometry import Polygon, Point, MultiPolygon
 
-from src.config import AppConfig, S2Config, DBConfig, CryptoConfig
+from src.config import AppConfig, S2Config, DBConfig, CryptoConfig, QueryConfig
 from src.crypto import GeometryCrypto
 from src.s2_utils import (
     polygon_to_s2_covering,
@@ -36,23 +33,18 @@ from src.s2_utils import (
 from src.indexing import process_single_village, extract_village_info
 
 
-# ========== 测试数据 ==========
-
-# 村落A：北京天安门附近矩形
 VILLAGE_A = Polygon([
     (116.38, 39.89), (116.42, 39.89),
     (116.42, 39.92), (116.38, 39.92),
     (116.38, 39.89),
 ])
 
-# 村落B：与村落A部分重叠（东侧）
 VILLAGE_B = Polygon([
     (116.40, 39.89), (116.44, 39.89),
     (116.44, 39.92), (116.40, 39.92),
     (116.40, 39.89),
 ])
 
-# 村落C：独立区域（不与A、B重叠）
 VILLAGE_C = Polygon([
     (116.50, 39.89), (116.54, 39.89),
     (116.54, 39.92), (116.50, 39.92),
@@ -65,8 +57,6 @@ VILLAGES = [
     {"geom": VILLAGE_C, "name": "朝阳村", "province": "北京", "city": "北京", "county": "朝阳"},
 ]
 
-
-# ========== SQLite替代数据库 ==========
 
 class SQLiteDatabase:
     """SQLite替代PostgreSQL，用于离线测试"""
@@ -91,6 +81,9 @@ class SQLiteDatabase:
     def commit(self):
         self._conn.commit()
 
+    def rollback(self):
+        self._conn.rollback()
+
     def _create_tables(self):
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS villages (
@@ -107,7 +100,7 @@ class SQLiteDatabase:
             CREATE TABLE IF NOT EXISTS village_s2_cells (
                 cell_id         INTEGER NOT NULL,
                 village_id      INTEGER NOT NULL REFERENCES villages(id) ON DELETE CASCADE,
-                is_interior     INTEGER NOT NULL,  -- 0=false, 1=true
+                is_interior     INTEGER NOT NULL,
                 level           INTEGER NOT NULL,
                 PRIMARY KEY (cell_id, village_id)
             );
@@ -173,6 +166,20 @@ class SQLiteDatabase:
                 results[row[0]] = row
         return list(results.values())
 
+    def query_cells_with_village_info(self, cell_ids):
+        if not cell_ids:
+            return []
+        placeholders = ",".join("?" * len(cell_ids))
+        cur = self._conn.execute(
+            f"""SELECT c.cell_id, c.village_id, c.is_interior, c.level,
+                       v.village_name, v.province, v.city, v.county
+                FROM village_s2_cells c
+                JOIN villages v ON c.village_id = v.id
+                WHERE c.cell_id IN ({placeholders})""",
+            cell_ids,
+        )
+        return [(r[0], r[1], bool(r[2]), r[3], r[4], r[5], r[6], r[7]) for r in cur.fetchall()]
+
     def get_village_by_id(self, village_id):
         cur = self._conn.execute(
             "SELECT id, village_name, province, city, county, cell_count, created_at FROM villages WHERE id = ?",
@@ -209,8 +216,6 @@ class SQLiteDatabase:
         return {row[0]: row[1] for row in cur.fetchall()}
 
 
-# ========== 测试用例 ==========
-
 def test_s2_covering():
     """测试S2覆盖生成与内部/边界区分"""
     print("\n" + "=" * 60)
@@ -223,7 +228,6 @@ def test_s2_covering():
     print(f"    内部Cell: {len(result.interior_cells)}个")
     print(f"    边界Cell: {len(result.boundary_cells)}个")
 
-    # 按level统计
     level_stats = {}
     for cell in result.cells:
         level_stats[cell.level] = level_stats.get(cell.level, 0) + 1
@@ -241,17 +245,14 @@ def test_ancestor_expansion():
     print("测试2: 祖先展开")
     print("=" * 60)
 
-    # 取天安门附近的一个点
     cell_id = point_to_s2_cell_id(39.90, 116.39, level=18)
     ancestors = expand_cell_ancestors(cell_id, min_level=12)
 
     print(f"  点(116.39, 39.90) level=18 Cell ID: {cell_id}")
     print(f"  祖先展开(12~18): {len(ancestors)}个")
 
-    # 验证包含自身和各级parent
     assert len(ancestors) == 7, f"从level 18到12应有7个祖先, 实际{len(ancestors)}"
 
-    # 验证每个祖先的level
     import s2sphere as s2
     levels = [s2.CellId(a).level() for a in ancestors]
     print(f"  祖先level: {levels}")
@@ -273,7 +274,6 @@ def test_cell_range():
     print(f"  range_max: {range_max}")
     print(f"  范围跨度: {range_max - range_min}")
 
-    # range_min < cell_id < range_max
     assert range_min <= cell_id <= range_max, "Cell ID应在自身范围内"
     print("  PASS Cell范围查询测试通过")
 
@@ -284,7 +284,6 @@ def test_encrypt_decrypt():
     print("测试4: 加密/解密流程")
     print("=" * 60)
 
-    # 生成临时密钥
     key = GeometryCrypto.generate_key()
     with tempfile.NamedTemporaryFile(suffix=".key", delete=False) as f:
         f.write(key)
@@ -294,7 +293,6 @@ def test_encrypt_decrypt():
         crypto_config = CryptoConfig(key_path=key_path)
         crypto = GeometryCrypto(crypto_config)
 
-        # 加密 → 解密 → 验证
         encrypted = crypto.encrypt_geometry(VILLAGE_A)
         decrypted = crypto.decrypt_to_geometry(encrypted)
 
@@ -314,7 +312,6 @@ def test_end_to_end():
     print("测试5: 端到端测试（入库 + 查询）")
     print("=" * 60)
 
-    # 生成临时密钥和数据库
     key = GeometryCrypto.generate_key()
     with tempfile.NamedTemporaryFile(suffix=".key", delete=False) as f:
         f.write(key)
@@ -324,7 +321,6 @@ def test_end_to_end():
         db_path = f.name
 
     try:
-        # 初始化
         crypto_config = CryptoConfig(key_path=key_path)
         crypto = GeometryCrypto(crypto_config)
         db = SQLiteDatabase(db_path)
@@ -332,9 +328,9 @@ def test_end_to_end():
 
         app_config = AppConfig(
             s2=S2Config(min_level=12, max_level=18, max_cells=500),
+            query=QueryConfig(max_cells=100, max_db_level=18),
         )
 
-        # ---- 入库 ----
         print("\n  --- 入库阶段 ---")
         village_ids = []
         for v in VILLAGES:
@@ -361,22 +357,20 @@ def test_end_to_end():
             print(f"    村落[{v['name']}]入库: ID={vid}, {len(covering.cells)}个Cell "
                   f"(内部{len(covering.interior_cells)}, 边界{len(covering.boundary_cells)})")
 
-        # ---- 点查询测试 ----
         print("\n  --- 点查询阶段 ---")
 
-        # 测试1: 点在天安村内部
-        test_point_1 = (116.40, 39.905)  # 天安村内部点
+        test_point_1 = (116.40, 39.905)
         leaf_cell_id = point_to_s2_cell_id(test_point_1[1], test_point_1[0], level=18)
         ancestor_ids = expand_cell_ancestors(leaf_cell_id, min_level=12)
-        cell_rows = db.query_cells_by_ids(ancestor_ids)
+        cell_rows = db.query_cells_with_village_info(ancestor_ids)
 
         print(f"    点{test_point_1}: 查到{len(cell_rows)}个匹配Cell")
         found_village = None
         boundary_candidates = set()
-        for cell_id, village_id, is_interior, level in cell_rows:
+        for row in cell_rows:
+            cell_id, village_id, is_interior, level, village_name, province, city, county = row
             if is_interior:
-                village_row = db.get_village_by_id(village_id)
-                found_village = village_row[1]  # village_name
+                found_village = village_name
                 break
             else:
                 boundary_candidates.add(village_id)
@@ -394,18 +388,17 @@ def test_end_to_end():
         print(f"    点{test_point_1} → 村落: {found_village}")
         assert found_village == "天安村", f"期望'天安村', 实际'{found_village}'"
 
-        # 测试2: 点在朝阳村
         test_point_2 = (116.52, 39.905)
         leaf_cell_id = point_to_s2_cell_id(test_point_2[1], test_point_2[0], level=18)
         ancestor_ids = expand_cell_ancestors(leaf_cell_id, min_level=12)
-        cell_rows = db.query_cells_by_ids(ancestor_ids)
+        cell_rows = db.query_cells_with_village_info(ancestor_ids)
 
         found_village = None
         boundary_candidates = set()
-        for cell_id, village_id, is_interior, level in cell_rows:
+        for row in cell_rows:
+            cell_id, village_id, is_interior, level, village_name, province, city, county = row
             if is_interior:
-                village_row = db.get_village_by_id(village_id)
-                found_village = village_row[1]
+                found_village = village_name
                 break
             else:
                 boundary_candidates.add(village_id)
@@ -423,16 +416,13 @@ def test_end_to_end():
         print(f"    点{test_point_2} → 村落: {found_village}")
         assert found_village == "朝阳村", f"期望'朝阳村', 实际'{found_village}'"
 
-        # ---- 面矢量查询测试 ----
         print("\n  --- 面矢量查询阶段 ---")
 
-        # 测试1: 查询与村落A相交的村落（应返回天安村和建國村）
-        query_poly = VILLAGE_A  # 与A完全重叠，与B部分重叠
+        query_poly = VILLAGE_A
         query_cells = polygon_to_query_cells(query_poly, min_level=12, max_level=18, max_cells=100)
-        exact_ids, range_conditions = build_query_conditions(query_cells, min_level=12)
+        exact_ids, range_conditions = build_query_conditions(query_cells, min_level=12, max_db_level=18)
         candidate_cells = db.query_cells_by_exact_and_range(exact_ids, range_conditions)
 
-        # 去重和分类
         village_hits = {}
         for cell_id, village_id, is_interior, level in candidate_cells:
             if village_id not in village_hits:
@@ -448,7 +438,6 @@ def test_end_to_end():
             else:
                 verify_ids.add(vid)
 
-        # 精确验证
         from shapely.prepared import prep
         prepared_input = prep(query_poly)
         if verify_ids:
@@ -467,14 +456,13 @@ def test_end_to_end():
         assert "天安村" in result_names, "应包含天安村"
         assert "建國村" in result_names, "应包含建國村（A与B部分重叠）"
 
-        # 测试2: 查询只与C相交的区域
         query_poly_2 = Polygon([
             (116.51, 39.90), (116.53, 39.90),
             (116.53, 39.91), (116.51, 39.91),
             (116.51, 39.90),
         ])
         query_cells_2 = polygon_to_query_cells(query_poly_2, min_level=12, max_level=18, max_cells=100)
-        exact_ids_2, range_conditions_2 = build_query_conditions(query_cells_2, min_level=12)
+        exact_ids_2, range_conditions_2 = build_query_conditions(query_cells_2, min_level=12, max_db_level=18)
         candidate_cells_2 = db.query_cells_by_exact_and_range(exact_ids_2, range_conditions_2)
 
         village_hits_2 = {}
@@ -530,15 +518,81 @@ def test_query_conditions():
     ])
 
     query_cells = polygon_to_query_cells(query_poly, min_level=12, max_level=18, max_cells=50)
-    exact_ids, range_conditions = build_query_conditions(query_cells, min_level=12)
+    exact_ids, range_conditions = build_query_conditions(query_cells, min_level=12, max_db_level=18)
 
     print(f"  查询Cell数: {len(query_cells)}")
     print(f"  精确匹配ID数: {len(exact_ids)}")
     print(f"  范围查询条件数: {len(range_conditions)}")
 
     assert len(exact_ids) > 0, "应有精确匹配ID"
-    # 高level Cell不需要范围查询
     print("  PASS 查询条件构建测试通过")
+
+
+def test_config_validation():
+    """测试配置参数校验"""
+    print("\n" + "=" * 60)
+    print("测试7: 配置参数校验")
+    print("=" * 60)
+
+    try:
+        S2Config(min_level=20, max_level=10)
+        assert False, "应抛出异常"
+    except ValueError as e:
+        print(f"  min_level > max_level: 正确抛出异常 - {e}")
+
+    try:
+        S2Config(min_level=-1)
+        assert False, "应抛出异常"
+    except ValueError as e:
+        print(f"  min_level < 0: 正确抛出异常 - {e}")
+
+    try:
+        S2Config(max_level=31)
+        assert False, "应抛出异常"
+    except ValueError as e:
+        print(f"  max_level > 30: 正确抛出异常 - {e}")
+
+    try:
+        DBConfig(pool_min=0)
+        assert False, "应抛出异常"
+    except ValueError as e:
+        print(f"  pool_min < 1: 正确抛出异常 - {e}")
+
+    try:
+        DBConfig(pool_min=10, pool_max=5)
+        assert False, "应抛出异常"
+    except ValueError as e:
+        print(f"  pool_max < pool_min: 正确抛出异常 - {e}")
+
+    print("  PASS 配置参数校验测试通过")
+
+
+def test_coordinate_validation():
+    """测试坐标校验"""
+    print("\n" + "=" * 60)
+    print("测试8: 坐标校验")
+    print("=" * 60)
+
+    from src.query import _validate_coordinates
+
+    _validate_coordinates(0, 0)
+    _validate_coordinates(180, 90)
+    _validate_coordinates(-180, -90)
+    print("  有效坐标: 通过")
+
+    try:
+        _validate_coordinates(181, 0)
+        assert False, "应抛出异常"
+    except ValueError as e:
+        print(f"  经度超出范围: 正确抛出异常 - {e}")
+
+    try:
+        _validate_coordinates(0, 91)
+        assert False, "应抛出异常"
+    except ValueError as e:
+        print(f"  纬度超出范围: 正确抛出异常 - {e}")
+
+    print("  PASS 坐标校验测试通过")
 
 
 if __name__ == "__main__":
@@ -547,6 +601,8 @@ if __name__ == "__main__":
     test_cell_range()
     test_encrypt_decrypt()
     test_query_conditions()
+    test_config_validation()
+    test_coordinate_validation()
     test_end_to_end()
 
     print("\n" + "=" * 60)

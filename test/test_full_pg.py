@@ -4,7 +4,12 @@
 完整测试：PostgreSQL + 中国市级矢量数据 (china.geojson)
 数据库: region_coverer (独立库，不污染默认postgres)
 """
-import os, sys, time, logging
+import os
+import sys
+import time
+import logging
+import tempfile
+
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
@@ -14,20 +19,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s',
                     handlers=[logging.StreamHandler(sys.stdout)])
 log = logging.getLogger(__name__)
 
-import psycopg2
 from cryptography.fernet import Fernet
-from src.config import AppConfig, S2Config, DBConfig, CryptoConfig
+from src.config import AppConfig, S2Config, DBConfig, CryptoConfig, QueryConfig
 from src.crypto import GeometryCrypto
 from src.db import Database
 from src.indexing import read_geojson_features, extract_village_info, process_single_village
 from src.query import locate_village_by_point, locate_villages_by_polygon
 from shapely.geometry import shape, Polygon, MultiPolygon
 
-# ---- 配置 ----
-PG_HOST, PG_PORT, PG_USER, PG_PASS = '127.0.0.1', 5432, 'postgres', 'pg'
-NEW_DB = 'region_coverer'
+PG_HOST = os.getenv("DB_HOST", "127.0.0.1")
+PG_PORT = int(os.getenv("DB_PORT", "5432"))
+PG_USER = os.getenv("DB_USER", "postgres")
+PG_PASS = os.getenv("DB_PASSWORD", "")
+NEW_DB = os.getenv("DB_NAME", "region_coverer")
 
-KEY_PATH = os.path.join(_project_root, 'test_key.bin')
+KEY_PATH = os.path.join(_project_root, "test_key.bin")
 if not os.path.exists(KEY_PATH):
     with open(KEY_PATH, 'wb') as f:
         f.write(Fernet.generate_key())
@@ -37,6 +43,7 @@ app_config = AppConfig(
     s2=S2Config(min_level=12, max_level=18, max_cells=500),
     db=DBConfig(host=PG_HOST, port=PG_PORT, dbname=NEW_DB, user=PG_USER, password=PG_PASS),
     crypto=CryptoConfig(key_path=KEY_PATH),
+    query=QueryConfig(max_cells=100, max_db_level=18),
 )
 GEOJSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'china.geojson')
 
@@ -44,46 +51,33 @@ GEOJSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'china.geojso
 def main():
     t_start = time.time()
 
-    # ========== Step 0: 重建数据库 ==========
     log.info("=" * 60)
     log.info("STEP 0: Recreate database '%s'", NEW_DB)
-    conn = psycopg2.connect(host=PG_HOST, port=PG_PORT, dbname='postgres',
-                            user=PG_USER, password=PG_PASS)
-    conn.autocommit = True
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (NEW_DB,))
-    if cur.fetchone():
-        cur.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=%s", (NEW_DB,))
-        cur.execute("DROP DATABASE %s" % NEW_DB)
-    cur.execute("CREATE DATABASE %s" % NEW_DB)
-    cur.close()
-    conn.close()
+    Database.drop_database_safely(app_config.db, NEW_DB)
+    Database.create_database_safely(app_config.db, NEW_DB)
     log.info("  Database '%s' created", NEW_DB)
 
-    # ========== Step 1: 建表 ==========
     log.info("=" * 60)
     log.info("STEP 1: Create schema")
-    conn = psycopg2.connect(host=PG_HOST, port=PG_PORT, dbname=NEW_DB,
-                            user=PG_USER, password=PG_PASS)
-    conn.autocommit = True
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE villages (
-        id BIGSERIAL PRIMARY KEY, village_name VARCHAR(100) NOT NULL,
-        province VARCHAR(50), city VARCHAR(50), county VARCHAR(50),
-        encrypted_geom BYTEA NOT NULL, cell_count INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT NOW())""")
-    cur.execute("CREATE INDEX idx_villages_county ON villages (province, city, county)")
-    cur.execute("""CREATE TABLE village_s2_cells (
-        cell_id BIGINT NOT NULL, village_id BIGINT NOT NULL REFERENCES villages(id) ON DELETE CASCADE,
-        is_interior BOOLEAN NOT NULL, level SMALLINT NOT NULL, PRIMARY KEY (cell_id, village_id))""")
-    cur.execute("CREATE INDEX idx_vsc_cell ON village_s2_cells (cell_id)")
-    cur.execute("CREATE INDEX idx_vsc_village ON village_s2_cells (village_id)")
-    cur.execute("CREATE INDEX idx_vsc_level ON village_s2_cells (level)")
-    cur.close()
-    conn.close()
+    schema_sql = """
+        CREATE TABLE villages (
+            id BIGSERIAL PRIMARY KEY, village_name VARCHAR(100) NOT NULL,
+            province VARCHAR(50), city VARCHAR(50), county VARCHAR(50),
+            encrypted_geom BYTEA NOT NULL, cell_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX idx_villages_county ON villages (province, city, county);
+        CREATE TABLE village_s2_cells (
+            cell_id BIGINT NOT NULL, village_id BIGINT NOT NULL REFERENCES villages(id) ON DELETE CASCADE,
+            is_interior BOOLEAN NOT NULL, level SMALLINT NOT NULL, PRIMARY KEY (cell_id, village_id)
+        );
+        CREATE INDEX idx_vsc_cell ON village_s2_cells (cell_id);
+        CREATE INDEX idx_vsc_village ON village_s2_cells (village_id);
+        CREATE INDEX idx_vsc_level ON village_s2_cells (level);
+    """
+    Database.execute_ddl(app_config.db, schema_sql)
     log.info("  Schema OK")
 
-    # ========== Step 2: 入库 ==========
     log.info("=" * 60)
     log.info("STEP 2: Index china.geojson (477 features)")
     db = Database(app_config.db)
@@ -116,7 +110,6 @@ def main():
         cur.execute("SELECT COUNT(*) FROM village_s2_cells WHERE is_interior"); ic = cur.fetchone()[0]
     log.info("  DB: %d villages, %d cells (%d interior, %d boundary)", vc, cc, ic, cc - ic)
 
-    # ========== Step 3: 点查询 ==========
     log.info("=" * 60)
     log.info("STEP 3: Point queries")
     test_pts = [
@@ -143,7 +136,6 @@ def main():
             log.info("  (%.3f,%.3f)->NOT FOUND (exp:%s) %.1fms", lng, lat, exp, ms)
     log.info("  Result: %d/%d hits, avg %.1fms", hit, len(test_pts), total_ms / len(test_pts))
 
-    # ========== Step 4: 面查询 ==========
     log.info("=" * 60)
     log.info("STEP 4: Polygon queries")
     tests = [
@@ -169,7 +161,6 @@ def main():
                  ", ".join(names[:8]) + ("..." if len(names) > 8 else ""))
     log.info("  Avg %.1fms/query", total_ms2 / len(tests))
 
-    # ========== Step 5: 统计 ==========
     log.info("=" * 60)
     log.info("STEP 5: Statistics")
     with db.cursor() as cur:

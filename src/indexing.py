@@ -1,12 +1,5 @@
 """
 村落矢量入库管道：GeoJSON/Shapefile读取 → S2覆盖生成 → 加密geometry → 批量写入
-
-对比原代码(deepseek_python_20260408_410ad7.py)的改进：
-1. geometry只加密存一份（主表），不再每个Cell行重复存储
-2. 区分interior/boundary Cell，标记is_interior
-3. S2参数调优：max_cells从20提升到500
-4. 支持批量写入（executemany）
-5. 密钥从配置加载，不再硬编码generate_key()
 """
 import json
 import logging
@@ -18,17 +11,13 @@ from shapely.geometry import shape, Polygon, MultiPolygon
 from .config import AppConfig, config as default_config
 from .crypto import GeometryCrypto
 from .db import Database
-from .s2_utils import polygon_to_s2_covering, CellEntry
+from .s2_utils import polygon_to_s2_covering
 
 logger = logging.getLogger(__name__)
 
 
 def read_geojson_features(geojson_path: str | Path) -> Iterator[dict]:
-    """
-    从GeoJSON文件读取Feature迭代器。
-
-    支持FeatureCollection和单个Feature。
-    """
+    """从GeoJSON文件读取Feature迭代器。"""
     with open(geojson_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -38,16 +27,11 @@ def read_geojson_features(geojson_path: str | Path) -> Iterator[dict]:
     elif data.get("type") == "Feature":
         yield data
     else:
-        # 可能是裸Geometry
         yield {"type": "Feature", "geometry": data, "properties": {}}
 
 
 def extract_village_info(feature: dict) -> dict:
-    """
-    从GeoJSON Feature中提取村落信息。
-
-    尝试从properties中读取标准字段，缺失则用默认值。
-    """
+    """从GeoJSON Feature中提取村落信息。"""
     props = feature.get("properties", {})
 
     return {
@@ -69,17 +53,12 @@ def process_single_village(
     village_info: dict,
     db: Database,
     crypto: GeometryCrypto,
-    app_config: AppConfig = None,
+    app_config: AppConfig | None = None,
 ) -> int:
-    """
-    处理单个村落：生成S2覆盖 → 加密geometry → 写入数据库。
-
-    返回: 村落ID
-    """
+    """处理单个村落：生成S2覆盖 → 加密geometry → 写入数据库。"""
     if app_config is None:
         app_config = default_config
 
-    # 1. 生成S2覆盖（区分内部/边界）
     covering = polygon_to_s2_covering(
         geom,
         min_level=app_config.s2.min_level,
@@ -95,16 +74,13 @@ def process_single_village(
         len(covering.boundary_cells),
     )
 
-    # 2. 加密geometry（只加密一次）
     encrypted_geom = crypto.encrypt_geometry(geom)
 
-    # 3. 构建Cell记录: [(cell_id, is_interior, level), ...]
     cell_records = [
         (cell.cell_id, cell.is_interior, cell.level)
         for cell in covering.cells
     ]
 
-    # 4. 事务性写入（主表+索引表）
     village_id = db.insert_village_with_cells(
         village_name=village_info["village_name"],
         encrypted_geom=encrypted_geom,
@@ -120,13 +96,9 @@ def process_single_village(
 
 def index_geojson_file(
     geojson_path: str | Path,
-    app_config: AppConfig = None,
+    app_config: AppConfig | None = None,
 ) -> list[int]:
-    """
-    将GeoJSON文件中的所有村落入库。
-
-    返回: 所有入库的村落ID列表
-    """
+    """将GeoJSON文件中的所有村落入库。"""
     if app_config is None:
         app_config = default_config
 
@@ -139,7 +111,6 @@ def index_geojson_file(
         for feature in read_geojson_features(geojson_path):
             geom = shape(feature.get("geometry", {}))
 
-            # 跳过非面类型
             if not isinstance(geom, (Polygon, MultiPolygon)):
                 logger.warning("跳过非面类型Geometry: %s", geom.geom_type)
                 continue
@@ -157,13 +128,9 @@ def index_geojson_file(
 
 def batch_index_geojson_files(
     geojson_paths: list[str | Path],
-    app_config: AppConfig = None,
+    app_config: AppConfig | None = None,
 ) -> list[int]:
-    """
-    批量入库多个GeoJSON文件。
-
-    复用同一数据库连接和加密器，减少连接开销。
-    """
+    """批量入库多个GeoJSON文件。"""
     if app_config is None:
         app_config = default_config
 
