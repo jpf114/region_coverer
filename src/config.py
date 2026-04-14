@@ -8,9 +8,9 @@ from dataclasses import dataclass, field
 @dataclass
 class S2Config:
     """S2 Region Coverer 参数"""
-    min_level: int = 12
+    min_level: int = 10
     max_level: int = 18
-    max_cells: int = 500
+    max_cells: int = 2000
 
     def __post_init__(self):
         if not (0 <= self.min_level <= 30):

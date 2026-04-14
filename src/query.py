@@ -1,11 +1,12 @@
 """
 查询服务：面矢量查询 + 点查询
 
-面矢量查询（核心新增）：输入Polygon → 返回所有相交的村落名称列表
+面矢量查询（核心新增）：输入 Polygon → 返回所有相交的村落名称列表
 点查询（修复）：输入经纬度 → 逐级向上回溯 → 返回所属村落
 """
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 
 from shapely.geometry import Point as ShapelyPoint
 from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon as ShapelyMultiPolygon
@@ -37,6 +38,51 @@ class VillageResult:
         return f"VillageResult(id={self.village_id}, name={self.village_name}, {self.province}/{self.city}/{self.county})"
 
 
+# 缓存键生成辅助函数
+def _make_point_cache_key(lng: float, lat: float) -> tuple:
+    """生成点查询缓存键（保留 3 位小数，精度约 100m）"""
+    return (round(lng, 3), round(lat, 3))
+
+
+def _make_polygon_cache_key(polygon: ShapelyPolygon | ShapelyMultiPolygon) -> str:
+    """生成面查询缓存键（使用 WKT 表示）"""
+    return polygon.wkt[:100]  # 取前 100 个字符作为键
+
+
+class QueryCache:
+    """查询结果缓存（LRU Cache）"""
+    
+    def __init__(self, maxsize: int = 10000):
+        self._point_cache = lru_cache(maxsize=maxsize)
+        self._polygon_cache = lru_cache(maxsize=maxsize)
+        self._point_data = {}
+        self._polygon_data = {}
+    
+    def get_point(self, lng: float, lat: float) -> VillageResult | None:
+        """获取点查询缓存结果"""
+        key = _make_point_cache_key(lng, lat)
+        return self._point_data.get(key)
+    
+    def set_point(self, lng: float, lat: float, result: VillageResult | None) -> None:
+        """设置点查询缓存结果"""
+        key = _make_point_cache_key(lng, lat)
+        self._point_data[key] = result
+    
+    def get_polygon(self, polygon: ShapelyPolygon | ShapelyMultiPolygon) -> list[VillageResult] | None:
+        """获取面查询缓存结果"""
+        key = _make_polygon_cache_key(polygon)
+        return self._polygon_data.get(key)
+    
+    def set_polygon(self, polygon: ShapelyPolygon | ShapelyMultiPolygon, results: list[VillageResult]) -> None:
+        """设置面查询缓存结果"""
+        key = _make_polygon_cache_key(polygon)
+        self._polygon_data[key] = results
+
+
+# 全局缓存实例
+_query_cache = QueryCache(maxsize=10000)
+
+
 def _village_row_to_result(row: tuple) -> VillageResult:
     """将数据库行(id, village_name, province, city, county)转为VillageResult"""
     return VillageResult(
@@ -63,7 +109,7 @@ def locate_village_by_point(
     crypto: GeometryCrypto,
     app_config: AppConfig | None = None,
 ) -> VillageResult | None:
-    """根据经纬度快速定位所属村落。"""
+    """根据经纬度快速定位所属村落（带缓存）。"""
     _validate_coordinates(lng, lat)
 
     if app_config is None:
@@ -72,12 +118,19 @@ def locate_village_by_point(
     min_level = app_config.s2.min_level
     max_level = app_config.s2.max_level
 
+    # 检查缓存
+    cached_result = _query_cache.get_point(lng, lat)
+    if cached_result is not None:
+        logger.debug("点查询缓存命中：(%.3f, %.3f)", lng, lat)
+        return cached_result
+
     leaf_cell_id = point_to_s2_cell_id(lat, lng, level=max_level)
     ancestor_ids = expand_cell_ancestors(leaf_cell_id, min_level)
 
     cell_rows_with_village = db.query_cells_with_village_info(ancestor_ids)
 
     if not cell_rows_with_village:
+        _query_cache.set_point(lng, lat, None)
         return None
 
     cell_rows_with_village.sort(key=lambda r: r[3], reverse=True)
@@ -90,7 +143,9 @@ def locate_village_by_point(
         village_info_cache[village_id] = (village_id, village_name, province, city, county)
 
         if is_interior:
-            return _village_row_to_result(village_info_cache[village_id])
+            result = _village_row_to_result(village_info_cache[village_id])
+            _query_cache.set_point(lng, lat, result)
+            return result
         else:
             boundary_candidates.add(village_id)
 
@@ -103,10 +158,13 @@ def locate_village_by_point(
                 polygon = crypto.decrypt_to_geometry(encrypted_geom)
                 if polygon.contains(query_point):
                     if village_id in village_info_cache:
-                        return _village_row_to_result(village_info_cache[village_id])
+                        result = _village_row_to_result(village_info_cache[village_id])
+                        _query_cache.set_point(lng, lat, result)
+                        return result
             except Exception as e:
-                logger.error("解密验证village_id=%d失败: %s", village_id, e)
+                logger.error("解密验证 village_id=%d 失败：%s", village_id, e)
 
+    _query_cache.set_point(lng, lat, None)
     return None
 
 
@@ -116,7 +174,7 @@ def locate_villages_by_polygon(
     crypto: GeometryCrypto,
     app_config: AppConfig | None = None,
 ) -> list[VillageResult]:
-    """面矢量查询：返回与输入Polygon相交的所有村落。"""
+    """面矢量查询：返回与输入 Polygon 相交的所有村落（带缓存）"""
     if app_config is None:
         app_config = default_config
 
@@ -124,6 +182,12 @@ def locate_villages_by_polygon(
     max_level = app_config.s2.max_level
     query_max_cells = app_config.query.max_cells
     max_db_level = app_config.query.max_db_level
+
+    # 检查缓存
+    cached_results = _query_cache.get_polygon(polygon)
+    if cached_results is not None:
+        logger.debug("面查询缓存命中：%s", _make_polygon_cache_key(polygon))
+        return cached_results
 
     query_cells = polygon_to_query_cells(
         polygon,
@@ -139,6 +203,7 @@ def locate_villages_by_polygon(
     candidate_cells = db.query_cells_by_exact_and_range(exact_ids, range_conditions)
 
     if not candidate_cells:
+        _query_cache.set_polygon(polygon, [])
         return []
 
     village_hits: dict[int, dict] = {}
@@ -172,6 +237,7 @@ def locate_villages_by_polygon(
                 logger.error("解密验证village_id=%d失败: %s", village_id, e)
 
     if not confirmed_ids:
+        _query_cache.set_polygon(polygon, [])
         return []
 
     village_rows = db.get_villages_by_ids(list(confirmed_ids))
@@ -182,8 +248,11 @@ def locate_villages_by_polygon(
 
     results.sort(key=lambda r: r.village_name)
 
+    # 缓存结果
+    _query_cache.set_polygon(polygon, results)
+
     logger.info(
-        "面查询完成: 候选%d个村落, 确认%d个相交",
+        "面查询完成：候选%d个村落，确认%d个相交",
         len(village_hits), len(results),
     )
 

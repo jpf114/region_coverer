@@ -226,24 +226,21 @@ class Database:
     def query_cells_by_ranges(
         self, range_conditions: list[tuple[int, int]]
     ) -> list[tuple]:
-        """根据Cell ID范围条件查询（捕获后代Cell）。"""
+        """根据 Cell ID 范围条件查询（使用 UNNEST 优化）。"""
         if not range_conditions:
             return []
 
-        conditions = []
-        params = []
-        for range_min, range_max in range_conditions:
-            conditions.append("cell_id BETWEEN %s AND %s")
-            params.extend([range_min, range_max])
-
-        sql_query = (
-            "SELECT cell_id, village_id, is_interior, level "
-            "FROM village_s2_cells "
-            "WHERE " + " OR ".join(conditions)
-        )
-
+        # 使用 UNNEST 方式替代大量 OR 条件，提升 SQL 效率
         with self.cursor() as cur:
-            cur.execute(sql_query, params)
+            cur.execute(
+                """SELECT cell_id, village_id, is_interior, level
+                   FROM village_s2_cells
+                   WHERE EXISTS (
+                       SELECT 1 FROM UNNEST(%s::bigint[], %s::bigint[]) AS ranges(rmin, rmax)
+                       WHERE cell_id BETWEEN rmin AND rmax
+                   )""",
+                ([r[0] for r in range_conditions], [r[1] for r in range_conditions]),
+            )
             return cur.fetchall()
 
     def query_cells_by_exact_and_range(
@@ -251,15 +248,28 @@ class Database:
         exact_ids: list[int],
         range_conditions: list[tuple[int, int]],
     ) -> list[tuple]:
-        """组合查询：精确匹配 + 范围查询（面矢量查询的核心）。"""
+        """组合查询：精确匹配 + 范围查询（使用 UNNEST 优化）。"""
         results = {}
 
-        if exact_ids:
-            for row in self.query_cells_by_ids(exact_ids):
-                results[row[0]] = row
+        # 使用 UNNEST 一次性查询精确匹配和范围匹配
+        exact_array = exact_ids if exact_ids else []
+        range_mins = [r[0] for r in range_conditions] if range_conditions else []
+        range_maxs = [r[1] for r in range_conditions] if range_conditions else []
 
-        if range_conditions:
-            for row in self.query_cells_by_ranges(range_conditions):
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT cell_id, village_id, is_interior, level
+                   FROM village_s2_cells
+                   WHERE (
+                       cell_id = ANY(%s::bigint[])
+                       OR EXISTS (
+                           SELECT 1 FROM UNNEST(%s::bigint[], %s::bigint[]) AS ranges(rmin, rmax)
+                           WHERE cell_id BETWEEN rmin AND rmax
+                       )
+                   )""",
+                (exact_array, range_mins, range_maxs),
+            )
+            for row in cur.fetchall():
                 results[row[0]] = row
 
         return list(results.values())
